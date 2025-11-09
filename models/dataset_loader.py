@@ -39,7 +39,9 @@ class Dataset:
     def __init__(self, conf):
         super(Dataset, self).__init__()
         print('Load data: Begin')
-        self.device = torch.device('cuda')
+        # Keep dataset on CPU to avoid OOM, will move batches to GPU during training
+        self.device = torch.device('cpu')
+        print('[Dataset] Storing on CPU to avoid GPU OOM')
         self.conf = conf
         normal_dir = conf.get_string('normal_dir')
         depth_dir = conf.get_string('depth_dir')
@@ -145,8 +147,8 @@ class Dataset:
             self.pose_all= add_noise_to_pose(pose_all = self.pose_all,rotation_noise_std=self.rotation_noise_std,translation_noise_std=self.translation_noise_std)
         # for mesh extraction
         # for mesh extraction
-        self.object_bbox_min = np.array([-1., -1., -1.])
-        self.object_bbox_max = np.array([1.,  1.,  1.])
+        self.object_bbox_min = np.array([-20., -20., -20.])
+        self.object_bbox_max = np.array([20.,  20.,  20.])
 
         # prepare instrincs
         intrinsics = self.intrinsics_all[0].detach()
@@ -177,7 +179,13 @@ class Dataset:
         ty = torch.linspace(0, self.H - 1, int(self.H // l))
         pixels_x, pixels_y = torch.meshgrid(tx, ty)
         p = torch.stack([pixels_x, pixels_y, torch.ones_like(pixels_y)], dim=-1) # W, H, 3
-        p = torch.matmul(self.intrinsics_all_inv[img_idx, None, None, :3, :3], p[:, :, :, None]).squeeze()  # W, H, 3
+        
+        # Ensure all tensors are on the same device as pose_all
+        device = pose_all.device
+        p = p.to(device)
+        intrinsics_inv = self.intrinsics_all_inv.to(device)
+        
+        p = torch.matmul(intrinsics_inv[img_idx, None, None, :3, :3], p[:, :, :, None]).squeeze()  # W, H, 3
         rays_v = p / torch.linalg.norm(p, ord=2, dim=-1, keepdim=True)  # W, H, 3
         rays_v = torch.matmul(pose_all[img_idx, None, None, :3, :3], rays_v[:, :, :, None]).squeeze()  # W, H, 3
         rays_o = pose_all[img_idx, None, None, :3, 3].expand(rays_v.shape)  # W, H, 3
@@ -302,10 +310,13 @@ class Dataset:
         # input normals and mask values for supervision
         normal = self.normals[img_idx_expand, patch_center_y_all, patch_center_x_all]  # (num_patch, patch_H, patch_W, 3)
         rotation_matrix = pose[:3, :3]
+        normal = normal.to(pose.device)
         normals_world = torch.einsum('ij,bhwj->bhwi',rotation_matrix , normal)
         #normal_world = torch.matmul(normal, rotation_matrix.T)
         mask = self.masks[img_idx_expand, patch_center_y_all, patch_center_x_all].unsqueeze(-1)#[..., :1]     # (num_patch, patch_H, patch_W)
         depth_toushi = self.perspective[img_idx_expand, patch_center_y_all, patch_center_x_all].unsqueeze(-1)
+        mask = mask.to(pose.device)
+        depth_toushi = depth_toushi.to(pose.device)
 
         # compute all ray directions within patches
         p_all = torch.stack([patch_center_x_all, patch_center_y_all, torch.ones_like(patch_center_y_all)], dim=-1).float().to(self.device)  # (num_patch, patch_H, patch_W, 3)
@@ -319,6 +330,7 @@ class Dataset:
         # the normal direction of the image/marching plane is the 3rd column of c2w transformation
         marching_plane_normal = self.pose_all[img_idx, :3, 2].expand((num_patch, 3))  # (num_patch, 3)
         """
+        rays_d_patch_all = rays_d_patch_all.to(pose.device)
         rays_d_patch_all = torch.matmul(rotation_matrix[None, None, :, :], rays_d_patch_all[..., None])[..., 0]  # (num_patch, patch_H, patch_W, 3)
         translation_vector = pose[:3, 3]
         

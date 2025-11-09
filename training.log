@@ -1,0 +1,6 @@
+nohup: ignoring input
+usage: exp_runner.py [-h] [--conf CONF] [--mode MODE]
+                     [--mcube_threshold MCUBE_THRESHOLD] [--is_continue]
+                     [--gpu GPU] [--obj_name OBJ_NAME]
+exp_runner.py: error: unrecognized arguments: --case bear
+Using cuda device

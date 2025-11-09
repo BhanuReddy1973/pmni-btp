@@ -1,8 +1,8 @@
 #!/bin/bash
 
-# Activate conda environment
-source ~/miniconda3/etc/profile.d/conda.sh
-conda activate PMNI
+# Activate conda environment (idempotent)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/scripts/activate_pmni.sh"
 
 # Get timestamp for log file
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)

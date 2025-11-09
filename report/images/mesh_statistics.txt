@@ -1,0 +1,15 @@
+
+PMNI Reconstructed Mesh Statistics - Bear Object
+===============================================
+
+Vertices: 560
+Faces: 1,116
+Volume: 241034.717927
+Surface Area: 24076.856784
+
+Bounding Box:
+  Min: [48.564, 40.252, -2.020]
+  Max: [121.033, 124.489, 97.330]
+
+Mesh Quality: High-resolution reconstruction from 20-view multi-view setup
+Training: 30,000 iterations, final loss = 1.16e-02

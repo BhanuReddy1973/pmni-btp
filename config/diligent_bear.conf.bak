@@ -31,7 +31,7 @@ train {
     change_posenet_epoch = 2000
     add_normal_loss_epoch = 4000
     #learing rate group
-    learning_rate = 1e-3
+    learning_rate = 5e-4
     learning_rate_alpha = 0.05
     pose_lr = 5e-4
     scale_lr =5e-4
@@ -39,7 +39,7 @@ train {
     increase_bindwidth_every = 1000
     warm_up_end = 500
     gradient_method = ad  
-    batch_size = 512
+    batch_size = 4096
     patch_size = 1  # i.e., each training step samples 2048 patches of 3x3 pixels
     use_white_bkgd = False
     pc_ratio = 2
@@ -75,17 +75,17 @@ train {
 }
 
 val {
-    save_freq = 5000
+    save_freq = 500000
 
-    val_normal_freq = 10000
+    val_normal_freq = 5000
     val_normal_resolution_level = 1
     gradient_method = ad  
 
-    val_mesh_freq = 10000
+    val_mesh_freq = 1000
     val_mesh_res = 512
-    report_freq = 100
-    eval_metric_freq = 10000
-    visual_pose_freq = 5000
+    report_freq = 5
+    eval_metric_freq = 1000
+    visual_pose_freq = 500
 }
 
 model {
@@ -116,9 +116,9 @@ model {
 
     encoding{
         otype=HashGrid,
-		n_levels=8
+		n_levels=14
 		n_features_per_level=2
-		log2_hashmap_size=15
+		log2_hashmap_size=19
 		base_resolution=32
 		per_level_scale=1.3195079107728942
    }

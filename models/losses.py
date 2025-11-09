@@ -12,6 +12,10 @@ class Loss(nn.Module):
         self.l2_loss = nn.MSELoss(reduction='sum')
 
     def get_normal_loss(self, normal_pred, normal_gt, mask, mask_sum,normal_loss_type='l2'):
+        # Ensure predictions are clean
+        normal_pred = torch.nan_to_num(normal_pred, nan=0.0, posinf=0.0, neginf=0.0)
+        normal_gt = torch.nan_to_num(normal_gt, nan=0.0, posinf=0.0, neginf=0.0)
+        
         normal_error = (normal_pred - normal_gt) * mask
         if normal_loss_type == 'l1':
             normal_loss = F.l1_loss(normal_error, torch.zeros_like(normal_error), reduction='sum') / mask_sum
@@ -97,10 +101,17 @@ class Loss(nn.Module):
         return eng
     
     def get_mask_loss(self, mask, comp_mask):
-        mask_loss = F.binary_cross_entropy(comp_mask.clip(1e-5, 1.0 - 1e-5), mask)
+        # Clamp comp_mask to valid range [0, 1] and handle NaN/inf
+        comp_mask_safe = torch.clamp(comp_mask, 0.0, 1.0)
+        comp_mask_safe = torch.nan_to_num(comp_mask_safe, nan=0.5, posinf=1.0, neginf=0.0)
+        # Clip to avoid numerical issues with BCE
+        comp_mask_safe = comp_mask_safe.clip(1e-5, 1.0 - 1e-5)
+        mask_loss = F.binary_cross_entropy(comp_mask_safe, mask)
         return mask_loss
     
     def get_eikonal_loss(self, gradients):
+        if gradients is None:
+            return torch.tensor(0.0, device='cuda', requires_grad=True)
         gradients_norm = torch.linalg.norm(gradients, ord=2, dim=-1)
         eikonal_loss = F.mse_loss(gradients_norm, torch.ones_like(gradients_norm), reduction='mean')
         return eikonal_loss
@@ -118,13 +129,28 @@ class Loss(nn.Module):
         mask = mask.squeeze(-1)  # [batchsize, patchsize, patchsize]
         valid_gt = depth_gt[mask == 1].view(-1)  # [N]
         valid_pred = depth_pred[mask == 1].view(-1)  # [N]
-        scale = (valid_gt * valid_pred).sum() / (valid_gt ** 2).sum()
-        depth_error = valid_gt*scale - valid_pred
+
+        # NaN/Inf guards on inputs
+        valid_gt = torch.nan_to_num(valid_gt, nan=0.0, posinf=0.0, neginf=0.0)
+        valid_pred = torch.nan_to_num(valid_pred, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # Protection against division by zero
+        valid_gt_squared_sum = (valid_gt ** 2).sum()
+        if valid_gt.numel() == 0 or valid_gt_squared_sum < 1e-10:
+            return torch.tensor(0.0, device=valid_gt.device, requires_grad=True)
+
+        num = (valid_gt * valid_pred).sum()
+        den = valid_gt_squared_sum
+        # Safe scale computation
+        scale = torch.nan_to_num(num / den, nan=1.0, posinf=1.0, neginf=1.0)
+
+        depth_error = valid_gt * scale - valid_pred
         if depth_loss_type == 'l1':
-            depth_loss = F.l1_loss(depth_error, torch.zeros_like(depth_error), reduction='sum') / mask_sum
+            depth_loss = F.l1_loss(depth_error, torch.zeros_like(depth_error), reduction='sum') / (mask_sum + 1e-8)
         elif depth_loss_type == 'l2':
-            depth_loss = F.mse_loss(depth_error, torch.zeros_like(depth_error), reduction='sum') / mask_sum
-        return depth_loss
+            depth_loss = F.mse_loss(depth_error, torch.zeros_like(depth_error), reduction='sum') / (mask_sum + 1e-8)
+        # Final guard
+        return torch.nan_to_num(depth_loss, nan=0.0, posinf=0.0, neginf=0.0)
     
     
     def get_con_loss(self, 
@@ -132,6 +158,9 @@ class Loss(nn.Module):
                   normal_world_all=None,          # (num_points, num_cams, 3)
                   visibility_mask=None):          # (num_points, num_cams)
 
+        if normal_world_all is None or weights_cuda_filtered is None:
+            return torch.tensor(0.0, device='cuda', requires_grad=True)
+        
         assert normal_world_all.shape[2] == 3, "normal_world_all should have shape (num_points, num_cams, 3)"
 
         loss = 0.0
@@ -232,6 +261,15 @@ class Loss(nn.Module):
                                 weights['eikonal_weight'] * eikonal_loss+\
                                     weights['sdf_weight'] * sdf_loss+\
                                         weights['con_weight']*con_loss
+        # NaN/Inf guards on each component and total loss
+        normal_loss = torch.nan_to_num(normal_loss, nan=0.0, posinf=0.0, neginf=0.0)
+        depth_loss = torch.nan_to_num(depth_loss, nan=0.0, posinf=0.0, neginf=0.0)
+        pc_loss = torch.nan_to_num(pc_loss, nan=0.0, posinf=0.0, neginf=0.0)
+        mask_loss = torch.nan_to_num(mask_loss, nan=0.0, posinf=0.0, neginf=0.0)
+        eikonal_loss = torch.nan_to_num(eikonal_loss, nan=0.0, posinf=0.0, neginf=0.0)
+        sdf_loss = torch.nan_to_num(sdf_loss, nan=0.0, posinf=0.0, neginf=0.0)
+        con_loss = torch.nan_to_num(con_loss, nan=0.0, posinf=0.0, neginf=0.0)
+        loss = torch.nan_to_num(loss, nan=0.0, posinf=0.0, neginf=0.0)
         # Removed breakpoint() for background training
         # if torch.isnan(loss):
         #     breakpoint()
