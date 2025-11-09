@@ -14,3 +14,5 @@ matplotlib
 scikit-image
 tqdm
 pyyaml
+open3d
+streamlit

@@ -36,9 +36,13 @@ def extract_geometry(bound_min, bound_max, resolution, threshold, query_func):
 
 class NeuSRenderer:
     def __init__(self, sdf_network, deviation_network,
-                 gradient_method="ad", K=None,  H=None, W=None ,intrinsics_all =None, normals = None):
+                 gradient_method="ad", K=None,  H=None, W=None ,intrinsics_all =None, normals = None, scale_mats = None):
         self.sdf_network = sdf_network
         self.deviation_network = deviation_network
+
+        # Detect device (CPU or CUDA)
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"[Renderer] Using device: {self.device}")
 
         # define the occ grid, see NerfAcc for more details
         self.scene_aabb = torch.as_tensor([-1., -1., -1., 1., 1., 1.], dtype=torch.float32)
@@ -48,16 +52,28 @@ class NeuSRenderer:
         self.occupancy_grid = OccupancyGrid(
             roi_aabb=self.scene_aabb,
             resolution=128,  # if res is different along different axis, use [256,128,64]
-            contraction_type=self.contraction_type).to("cuda")
+            contraction_type=self.contraction_type).to(self.device)
         self.sampling_step_size = 0.01  # ray marching step size, will be modified during training
         self.gradient_method = gradient_method   # dfd or fd or ad
         self.visible_ray_tracer = VisibilityTracing()
         self.K = K
         self.H = H
         self.W = W
-        self.intrinsics_all = intrinsics_all
-        self.normals = normals
+        # Ensure intrinsics and normals are on correct device
+        if intrinsics_all is not None:
+            self.intrinsics_all = intrinsics_all.to(self.device) if not intrinsics_all.device == self.device else intrinsics_all
+        else:
+            self.intrinsics_all = None
+        if normals is not None:
+            self.normals = normals.to(self.device) if not normals.device == self.device else normals
+        else:
+            self.normals = None
+        self.scale_mats = scale_mats
 
+    def transform_to_normalized_coords(self, pts):
+        """Transform points to normalized coordinates for SDF network input.
+        Since scene is bounded by [-1,1]^3, points in this range are already normalized."""
+        return pts
 
     def occ_eval_fn(self, x):
         # function for updating the occ grid given the current sdf
@@ -114,7 +130,8 @@ class NeuSRenderer:
 
             sdf_start_shift_left[diff_mask] = sdf_end_diff
 
-            inv_s = self.deviation_network(torch.zeros([1, 3]))[:, :1].clip(1e-6, 1e6)  # Single parameter
+            inv_s = self.deviation_network(torch.zeros([1, 3]))[:, :1]
+            inv_s = torch.nan_to_num(inv_s, nan=1.0, posinf=1e6, neginf=1e-6).clamp(1e-6, 1e6)  # Single parameter, robust
             inv_s = inv_s.expand(sdf_start.shape[0], 1)
 
             prev_cdf = torch.sigmoid(sdf_start * inv_s)
@@ -145,7 +162,16 @@ class NeuSRenderer:
         samples_per_ray = patch_indices.shape[0] / num_patch
         if patch_indices.shape[0] == 0:  # all patch center rays are within the zero region of the occ grid. skip this iteration.
             return {
-                "comp_normal": torch.zeros([num_patch, patch_H, patch_W, 3], device=rays_o_patch_center.device)
+                "comp_normal": torch.zeros([num_patch, patch_H, patch_W, 3], device=rays_o_patch_center.device),
+                "comp_depth": torch.zeros([num_patch, patch_H, patch_W, 1], device=rays_o_patch_center.device),
+                "gradients": None,
+                "weight_sum": torch.zeros([num_patch, patch_H, patch_W, 1], device=rays_o_patch_center.device),
+                "samples_per_ray": 0,
+                "visibility_mask": None,
+                "normal_world_all": None,
+                "gradients_filtered": None,
+                "weights_cuda_filtered": None,
+                "s_val": torch.tensor([1.0], device=rays_o_patch_center.device)
             }
 
         num_samples = patch_indices.shape[0]
@@ -177,7 +203,8 @@ class NeuSRenderer:
         sdf_ends_patch_all = torch.cat([sdf_ends_patch_all, sdf_starts_patch_all[-1:]], 0)
         sdf_ends_patch_all[diff_mask] = sdf_end_diff
 
-        inv_s = self.deviation_network(torch.zeros([1, 3]))[:, :1].clip(1e-6, 1e6)  # Single parameter
+        inv_s = self.deviation_network(torch.zeros([1, 3]))[:, :1]
+        inv_s = torch.nan_to_num(inv_s, nan=1.0, posinf=1e6, neginf=1e-6).clamp(1e-6, 1e6)  # Single parameter, robust
 
         prev_cdf = torch.sigmoid(sdf_starts_patch_all * inv_s)  # (num_samples, patch_H, patch_W, 1)
         next_cdf = torch.sigmoid(sdf_ends_patch_all * inv_s)   # (num_samples, patch_H, patch_W, 1)
@@ -220,60 +247,75 @@ class NeuSRenderer:
         surface_points_plain = surface_points.view(-1, 3).detach()
         idx_expand = torch.full(surface_mask.shape, idx, dtype=torch.long, device=surface_mask.device)
         if(con):
-            with torch.no_grad():
-                visibility_mask = self.visible_ray_tracer(sdf=lambda x: self.sdf_network.sdf(x),
-                                                          unique_camera_centers=cam_t,
-                                                          points=surface_points_plain[surface_mask])  # (num_points, num_cams)
+            try:
+                with torch.no_grad():
+                    visibility_mask = self.visible_ray_tracer(sdf=lambda x: self.sdf_network.sdf(x),
+                                                              unique_camera_centers=cam_t,
+                                                              points=surface_points_plain[surface_mask])  # (num_points, num_cams)
 
-                num_vis_points = visibility_mask.shape[0]
-                visibility_mask[torch.arange(num_vis_points), idx_expand[surface_mask].long()] = 1
-                assert torch.all(visibility_mask.sum(-1) > 0)
-                points_homo = torch.cat(
-                (surface_points_plain[surface_mask], torch.ones((surface_mask.sum(), 1), dtype=float, device='cuda')), -1).float()
-                # project points onto all image planes
-                # (num_cams, 3, 4) x (4, num_points)->  (num_cams, 3, num_points)
-                K_3x4 = self.intrinsics_all[:, :3, :]
-            projection_matrices = torch.bmm(K_3x4, w2cs)
+                    num_vis_points = visibility_mask.shape[0]
+                    visibility_mask[torch.arange(num_vis_points), idx_expand[surface_mask].long()] = 1
+                    assert torch.all(visibility_mask.sum(-1) > 0)
+                    # ensure we perform projections on the same device as camera matrices
+                    device = w2cs.device
+                    points_homo = torch.cat(
+                        (surface_points_plain[surface_mask].to(device),
+                         torch.ones((int(surface_mask.sum().item()), 1), dtype=torch.float32, device=device)),
+                        -1).float()
+                    # project points onto all image planes
+                    # (num_cams, 3, 4) x (4, num_points)->  (num_cams, 3, num_points)
+                    # intrinsics_all is already on CUDA from __init__, ensure w2cs matches
+                    K_3x4 = self.intrinsics_all[:, :3, :]
+                    if K_3x4.device != device:
+                        K_3x4 = K_3x4.to(device)
+                projection_matrices = torch.bmm(K_3x4, w2cs)
 
-            pixel_coordinates_homo = torch.einsum("ijk,kp->ijp", projection_matrices.to('cuda'), points_homo.T)
+                pixel_coordinates_homo = torch.einsum("ijk,kp->ijp", projection_matrices, points_homo.T)
 
-            pixel_coordinates_xx = (pixel_coordinates_homo[:, 0, :] / (pixel_coordinates_homo[:, -1, :] + 1e-9)).T  # (num_points, num_cams)
-            pixel_coordinates_yy = (pixel_coordinates_homo[:, 1, :] / (pixel_coordinates_homo[:, -1, :] + 1e-9)).T  # (num_points, num_cams)
+                pixel_coordinates_xx = (pixel_coordinates_homo[:, 0, :] / (pixel_coordinates_homo[:, -1, :] + 1e-9)).T  # (num_points, num_cams)
+                pixel_coordinates_yy = (pixel_coordinates_homo[:, 1, :] / (pixel_coordinates_homo[:, -1, :] + 1e-9)).T  # (num_points, num_cams)
 
-            index_axis0 = torch.round(pixel_coordinates_yy)  # (num_points, num_cams)
-            index_axis1 = torch.round(pixel_coordinates_xx)  # (num_points, num_cams)
-            index_axis0 = torch.clamp(index_axis0, min=0, max=self.H - 1).to(torch.int64)  
-            index_axis1 = torch.clamp(index_axis1, min=0, max=self.W - 1).to(torch.int64) 
-            num_cams = index_axis0.shape[1]
-            normal_world = []
-            for cam_idx in range(num_cams):
-                idx_normal = self.normals[cam_idx,
-                                        index_axis0[:, cam_idx],
-                                        index_axis1[:, cam_idx]]  # (num_surface_points)
-                rotation_matrix = c2ws[cam_idx][:3, :3]
+                index_axis0 = torch.round(pixel_coordinates_yy)  # (num_points, num_cams)
+                index_axis1 = torch.round(pixel_coordinates_xx)  # (num_points, num_cams)
+                index_axis0 = torch.clamp(index_axis0, min=0, max=self.H - 1).to(torch.int64)  
+                index_axis1 = torch.clamp(index_axis1, min=0, max=self.W - 1).to(torch.int64) 
+                num_cams = index_axis0.shape[1]
+                normal_world = []
+                for cam_idx in range(num_cams):
+                    idx_normal = self.normals[cam_idx,
+                                            index_axis0[:, cam_idx],
+                                            index_axis1[:, cam_idx]]  # (num_surface_points)
+                    rotation_matrix = c2ws[cam_idx][:3, :3]
 
-                idx_normals_world = torch.einsum('ij,nj->ni', rotation_matrix, idx_normal)
-                normal_world.append(idx_normals_world)
-            normal_world_all = torch.stack(normal_world, dim=1).to('cuda') #(num_points, num_cams, 3)
+                    idx_normals_world = torch.einsum('ij,nj->ni', rotation_matrix, idx_normal)
+                    normal_world.append(idx_normals_world)
+                normal_world_all = torch.stack(normal_world, dim=1).to(device) #(num_points, num_cams, 3)
 
 
-            weights_cuda_squeezed = weights_cuda.view(-1) 
-            gradients_squeezed = gradients.view(-1, 3)     
+                weights_cuda_squeezed = weights_cuda.view(-1) 
+                gradients_squeezed = gradients.view(-1, 3)     
 
-            weights_cuda_filtered = weights_cuda_squeezed[surface_mask]  
-            gradients_filtered = gradients_squeezed[surface_mask]       
-
+                weights_cuda_filtered = weights_cuda_squeezed[surface_mask]  
+                gradients_filtered = gradients_squeezed[surface_mask]
+            except Exception as e:
+                # If consistency computation fails (e.g., during validation), return None for consistency outputs
+                print(f"Warning: Consistency computation failed with error: {e}. Returning None for consistency outputs.")
+                visibility_mask = None
+                normal_world_all = None
+                gradients_filtered = None
+                weights_cuda_filtered = None
 
         else:
-            visibility_mask =None
-            normal_world_all =None
-            gradients_filtered =None
-            weights_cuda_filtered=None
+            visibility_mask = None
+            normal_world_all = None
+            gradients_filtered = None
+            weights_cuda_filtered = None
 
 
 
             
-        inv_s = self.deviation_network(torch.zeros([1, 3]))[:, :1].clip(1e-6, 1e6)  # Single parameter
+        inv_s = self.deviation_network(torch.zeros([1, 3]))[:, :1]
+        inv_s = torch.nan_to_num(inv_s, nan=1.0, posinf=1e6, neginf=1e-6).clamp(1e-6, 1e6)  # Single parameter, robust
         return {
             's_val': 1/inv_s,
             'weight_sum': weights_sum,

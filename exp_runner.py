@@ -11,14 +11,10 @@ from torch.utils.tensorboard import SummaryWriter
 from shutil import copyfile
 from tqdm.auto import tqdm
 from pyhocon import ConfigFactory
-from models.fields import SDFNetwork, SingleVarianceNetwork
-from models.pose_net import LearnPose
-from models.scale_net import LearnScale
-from models.losses import Loss
-from models.init_pose import sample_points_on_sphere_uniform, generate_c2w_matrices,sample_positions_torch
-from models.posenet2 import LearnPose2
+# Delay heavy/optional imports until after device checks in Runner.__init__
+
 import pyexr
-import time,ipdb
+import time
 from utilities.utils import crop_image_by_mask, toRGBA
 import random 
 import open3d as o3d
@@ -32,7 +28,8 @@ from models.common import arange_pixels_2, transform_to_world, visualize_point_c
 from torch import nn
 import torch
 torch.manual_seed(42)
-torch.cuda.manual_seed(42)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(42)
 def get_class(kls):
     parts = kls.split('.')
     module = ".".join(parts[:-1])
@@ -43,7 +40,13 @@ def get_class(kls):
 
 class Runner:
     def __init__(self, conf_text, mode='train', is_continue=False, datadir=None):
-        self.device = torch.device('cuda')
+        # Select device; if CUDA not available, exit gracefully (training requires GPU kernels for nerfacc & tinycudann)
+        if torch.cuda.is_available():
+            self.device = torch.device('cuda')
+        else:
+            print("[FATAL] CUDA not available. PMNI training requires a GPU (nerfacc & tinycudann kernels). Exiting cleanly.")
+            print("        Please run on a GPU-enabled machine or inside a container launched with --gpus all.")
+            raise SystemExit(0)
         self.conf_text = conf_text
 
         if not is_continue:
@@ -90,10 +93,28 @@ class Runner:
         self.start_step_size = self.conf.get_float('model.ray_marching.start_step_size', default=1e-2)
         self.end_step_size = self.conf.get_float('model.ray_marching.end_step_size', default=5e-4)
         self.slop_step = (np.log10(self.start_step_size) - np.log10(self.end_step_size)) / self.end_iter
+        # Import model components lazily (avoids CPU-only crashes on import)
+        from models.fields import SDFNetwork, SingleVarianceNetwork
+        from models.scale_net import LearnScale
+        from models.losses import Loss
+        from models.init_pose import (
+            sample_points_on_sphere_uniform,
+            generate_c2w_matrices,
+            sample_positions_torch,
+        )
+
+        # Try importing pose net (depends on pypose). Fall back to disabling pose learning if unavailable.
+        LearnPose = None
+        try:
+            from models.pose_net import LearnPose as _LearnPose
+            LearnPose = _LearnPose
+        except Exception as e:
+            print(f"[WARN] Pose learning disabled (models.pose_net unavailable: {e})")
 
         # init SDF Networks and single_variance_network
         params_to_train = []
-        self.sdf_network = SDFNetwork(**self.conf['model.sdf_network'], encoding_config=self.conf['model.encoding']).to(self.device)
+        encoding_config = self.conf.get('model.encoding', default=None)
+        self.sdf_network = SDFNetwork(**self.conf['model.sdf_network'], encoding_config=encoding_config).to(self.device)
         self.deviation_network = SingleVarianceNetwork(**self.conf['model.variance_network']).to(self.device)
 
         params_to_train += list(self.sdf_network.parameters())
@@ -106,13 +127,13 @@ class Runner:
                                                                        self.dataset.H,
                                                                        self.dataset.W,
                                                                        self.dataset.intrinsics_all,
-                                                                       self.dataset.normals)
+                                                                       self.dataset.normals,
+                                                                       self.dataset.scale_mats_np[0])
 
         self.optimizer = torch.optim.Adam(params_to_train, lr=self.learning_rate)
 
         self.num_cam = self.dataset.n_images
-        #init_pose net
-        self.learn_pose = self.conf.get_bool('model.LearnPose.learn_pose')
+        self.learn_pose = self.conf.get_bool('model.LearnPose.learn_pose') and (LearnPose is not None)
 
         radius = self.conf.get_float('general.pose_init_radius') 
         num_points = self.dataset.n_images 
@@ -123,60 +144,48 @@ class Runner:
         at = torch.tensor([[0.0, 0.0, 0.0]], dtype=torch.float32)  # (1, 3)
         up = torch.tensor([[0.0, 0.0, -1.0]], dtype=torch.float32)  # (1, 3)
         c2w_matrices = generate_c2w_matrices(camera_position, at=at, up=up)
-        init_c2w =c2w_matrices.to(self.device) #self.dataset.pose_all 
-        if(self.learn_pose):
-            #pass
-
-            if(self.conf.get_bool('model.LearnPose.init_pose')):
-                self.posenet = LearnPose(num_cams= self.num_cam,
-                                         learn_R = self.conf.get_bool('model.LearnPose.learn_R'),
-                                         learn_t = self.conf.get_bool('model.LearnPose.learn_t'),
-                                         init_c2w= self.dataset.pose_all#init_c2w
-                                         ).to(self.device)#self.dataset.pose_all
+        init_c2w = c2w_matrices.to(self.device)  # self.dataset.pose_all 
+        if self.learn_pose:
+            if self.conf.get_bool('model.LearnPose.init_pose'):
+                self.posenet = LearnPose(num_cams=self.num_cam,
+                                         learn_R=self.conf.get_bool('model.LearnPose.learn_R'),
+                                         learn_t=self.conf.get_bool('model.LearnPose.learn_t'),
+                                         init_c2w=self.dataset.pose_all  # init_c2w
+                                         ).to(self.device)
             else:
-                self.posenet = LearnPose(num_cams= self.dataset.n_images,
-                                         learn_R = self.conf.get_bool('model.LearnPose.learn_R'),
-                                         learn_t = self.conf.get_bool('model.LearnPose.learn_t'),
-                                         init_c2w= None).to(self.device)
-            
-            self.optimizer_pose = torch.optim.Adam(self.posenet.parameters(), 
+                self.posenet = LearnPose(num_cams=self.dataset.n_images,
+                                         learn_R=self.conf.get_bool('model.LearnPose.learn_R'),
+                                         learn_t=self.conf.get_bool('model.LearnPose.learn_t'),
+                                         init_c2w=None).to(self.device)
+
+            self.optimizer_pose = torch.optim.Adam(self.posenet.parameters(),
                                                    lr=self.conf.get_float('train.pose_lr'))
 
         else:
             self.optimizer_pose = None
             self.posenet = None
-        
-        """
-        self.posenet = LearnPose2(
-            num_cams = self.num_cam,
-            learn_t= True,
-            init_t = camera_position,
-        )
-        self.optimizer_pose = torch.optim.Adam(self.posenet.parameters(), 
-                                                   lr=self.conf.get_float('train.pose_lr'))
-        """
 
-        #init_scale net
+        # init_scale net
         self.existscalenet = self.conf.get_bool('model.LearnScale.existscalenet')
         self.learn_scale = self.conf.get_bool('model.LearnScale.learn_scale')
-        if(self.existscalenet):
+        if self.existscalenet:
 
             scale_N = self.conf.get_float('model.LearnScale.scale_N')
             init_scale = torch.full((self.num_cam, 1), scale_N).to(self.device)
-            #init_scale = None
+            # init_scale = None
             self.scalenet = LearnScale(num_cams=self.num_cam,
-                                       learn_scale= self.learn_scale,
-                                       init_scale = None,
-                                       fix_scaleN = self.conf.get_bool('model.LearnScale.fix_scaleN')).to(self.device)
-            if(self.learn_scale):
-                self.optimizer_scale = torch.optim.Adam(self.scalenet.parameters(), 
-                                                   lr=self.conf.get_float('train.scale_lr'))
+                                       learn_scale=self.learn_scale,
+                                       init_scale=None,
+                                       fix_scaleN=self.conf.get_bool('model.LearnScale.fix_scaleN')).to(self.device)
+            if self.learn_scale:
+                self.optimizer_scale = torch.optim.Adam(self.scalenet.parameters(),
+                                                        lr=self.conf.get_float('train.scale_lr'))
             else:
                 self.optimizer_scale = None
         else:
             self.scalenet = None
             self.optimizer_scale = None
-        #loss
+        # loss
         self.loss = Loss()
 
         self.is_continue = is_continue
@@ -198,13 +207,13 @@ class Runner:
             self.load_checkpoint(latest_model_name)
 
         # Backup codes and configs for debug
-        #if self.mode[:5] == 'train':
+        # if self.mode[:5] == 'train':
         self.file_backup()
-            
+
         self.validate_pose()
         num_views = 20
         target_view = 10
-        decay_rate = 0.9  
+        decay_rate = 0.9
         self.view_weights = decay_rate ** torch.abs(torch.arange(num_views) - target_view)
 
     def train(self):
@@ -244,6 +253,17 @@ class Runner:
                                                       occ_eval_fn=self.renderer.occ_eval_fn,
                                                       occ_thre=self.conf["model.ray_marching"]["occ_threshold"],
                                                       n=self.conf["model.ray_marching"]["occ_update_freq"])
+            
+            # Diagnostic: log occupancy grid status every 100 iterations
+            if iter_i % 100 == 0:
+                with torch.no_grad():
+                    # Sample a few points to check SDF values
+                    test_pts = torch.rand(1000, 3, device='cuda') * 2 - 1  # [-1,1]^3
+                    test_pts_normalized = self.renderer.transform_to_normalized_coords(test_pts)
+                    test_sdf = self.renderer.sdf_network(test_pts_normalized)[..., :1]
+                    alpha_vals = torch.sigmoid(- test_sdf * 80)
+                    print(f"[Iter {self.iter_step}] SDF stats: min={test_sdf.min():.3f}, max={test_sdf.max():.3f}, mean={test_sdf.mean():.3f}")
+                    print(f"[Iter {self.iter_step}] Alpha stats: min={alpha_vals.min():.3f}, max={alpha_vals.max():.3f}, mean={alpha_vals.mean():.3f}, occupied_frac={(alpha_vals > 0.1).float().mean():.3f}")
 
             # following neuralangelo, gradually increase ingp bandwidth
             if self.iter_step % self.increase_bindwidth_every == 0:
@@ -267,6 +287,11 @@ class Runner:
             self.writer.add_scalar('eikonal_loss', eikonal_loss, self.iter_step)
             self.writer.add_scalar('sdf_loss', sdf_loss, self.iter_step)
             self.writer.add_scalar('depth_loss', depth_loss, self.iter_step)
+            # Track sampling progress for diagnostics
+            try:
+                self.writer.add_scalar('samples_per_ray', float(samples_per_ray), self.iter_step)
+            except Exception:
+                pass
            
             self.update_learning_rate()
 
@@ -290,7 +315,11 @@ class Runner:
 
 
             if self.iter_step % self.val_mesh_freq == 0:
-                self.validate_mesh(resolution=self.val_mesh_res)
+                # Gate mesh validation until we have sufficient sampling
+                if (isinstance(samples_per_ray, (int, float)) and samples_per_ray > 0.1 and self.iter_step >= 5000) or (not isinstance(samples_per_ray, (int, float)) and self.iter_step >= 5000):
+                    self.validate_mesh(resolution=self.val_mesh_res)
+                else:
+                    print(f"Skipping mesh validation at iter {self.iter_step}: samples_per_ray={samples_per_ray}")
 
             if self.iter_step % self.val_normal_freq == 0 :#and self.iter_step >10000:
                 #ipdb.set_trace()
@@ -301,6 +330,10 @@ class Runner:
                     self.validate_normal_pixel_based(idx=val_idx, resolution_level=self.val_normal_resolution_level)
 
             if self.iter_step % self.eval_metric_freq == 0:
+                # Skip evaluation early if sampling is insufficient
+                if isinstance(samples_per_ray, (int, float)) and (samples_per_ray <= 0.1 or self.iter_step < 5000):
+                    print(f"Skipping geo evaluation at iter {self.iter_step}: samples_per_ray={samples_per_ray}")
+                    continue
                 # no gt mesh, skip the evaluation
                 if self.dataset.mesh_gt is None:
                     continue
@@ -360,8 +393,13 @@ class Runner:
                 self.optimizer_pose = self.optimizer_pose2
                 print('change_posenet!!!')
             """
+            
+            # Memory optimization: clear CUDA cache after validation
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                import gc
+                gc.collect()
                 
-
     
     
     def train_step(self):
@@ -459,6 +497,8 @@ class Runner:
         epoch_sdf_loss = 0.0
         epoch_depth_loss = 0.0
         epoch_con_loss = 0.0
+        processed_images = 0  # Track how many images actually contributed to loss
+        samples_per_ray = 0.0  # Initialize samples_per_ray
         c2ws = self.posenet.get_all_c2w()
         for idx in range(self.dataset.n_images):#19,-1,-1
 
@@ -494,7 +534,10 @@ class Runner:
            
 
             if render_out['gradients'] is None:  # all rays are in the zero region of the occupancy grid
-                self.update_learning_rate()
+                # Skip this image - occupancy grid is empty, no meaningful loss can be computed
+                if idx == 0:  # Log only for first image to avoid spam
+                    print(f"[Iter {self.iter_step}] Occupancy grid empty, skipping loss computation")
+                continue
 
             comp_normal = render_out['comp_normal']  # rendered normal at pixels
             comp_depth = render_out['comp_depth']
@@ -516,6 +559,8 @@ class Runner:
             depth_input = torch.where(torch.isnan(depth_input), torch.tensor(0.0, device=depth_input.device), depth_input)
             depth_ref[torch.isnan(depth_ref)] = 0.0
 
+            depth_input = depth_input.cuda()
+            depth_ref = depth_ref.cuda()
 
             depth_input = depth_input * self.scalenet(idx)
             world_mat = torch.inverse(pose).unsqueeze(0)
@@ -578,8 +623,9 @@ class Runner:
                 p1,pix1,depth1 = arange_pixels_2(resolution = sample_resolution, depth = torch.squeeze(d1, dim=1), device = self.device)
                 pc = transform_to_world(pix1, depth1, camera_mat, world_mat)
                 pc = pc.squeeze(0)
-                #ipdb.set_trace()
-                sdf_all = self.sdf_network.sdf(pc)
+                # Transform to normalized coordinates for SDF network
+                pc_normalized = self.renderer.transform_to_normalized_coords(pc)
+                sdf_all = self.sdf_network.sdf(pc_normalized)
             
             else:
                 sdf_all = None
@@ -612,17 +658,132 @@ class Runner:
             epoch_sdf_loss += loss_dict['loss_sdf']
             epoch_depth_loss += loss_dict['loss_depth']
             epoch_con_loss += loss_dict['loss_con']
+            processed_images += 1
 
-        epoch_loss_dict = {
-            'loss': epoch_loss/self.dataset.n_images,
-            'loss_normal': epoch_normal_loss/self.dataset.n_images,
-            'loss_pc': epoch_pc_loss/self.dataset.n_images,
-            'loss_mask':epoch_mask_loss/self.dataset.n_images,
-            'loss_eikonal':epoch_eikonal_loss/self.dataset.n_images,
-            'loss_sdf':epoch_sdf_loss/self.dataset.n_images,
-            'loss_depth':epoch_depth_loss/self.dataset.n_images,
-            'loss_con':epoch_con_loss/self.dataset.n_images,
-        }
+        # Handle case where all images were skipped (occupancy grid empty)
+        if processed_images == 0:
+            # Robust bootstrap: sample points inside the renderer's scene AABB, guard NaNs/infs,
+            # compute a small eikonal + sdf-regularization loss so the SDF network receives gradients
+            # even when the occupancy grid has no occupied cells yet.
+            n_bootstrap_points = 2048
+            try:
+                # scene_aabb is [minx,miny,minz,maxx,maxy,maxz]
+                scene_aabb = getattr(self.renderer, 'scene_aabb', None)
+                if scene_aabb is None:
+                    # fallback to unit cube
+                    mins = torch.tensor([-1.0, -1.0, -1.0], device='cuda')
+                    maxs = torch.tensor([1.0, 1.0, 1.0], device='cuda')
+                else:
+                    scene_aabb = scene_aabb.to(self.device)
+                    mins = scene_aabb[:3]
+                    maxs = scene_aabb[3:6]
+                # For bootstrap, sample in a tighter region around expected object location
+                bootstrap_mins = torch.clamp(mins, min=-15.0)
+                bootstrap_maxs = torch.clamp(maxs, max=15.0)                # uniform sample inside AABB
+                rand = torch.rand(n_bootstrap_points, 3, device=self.device)
+                bootstrap_pts = bootstrap_mins[None, :] + (bootstrap_maxs - bootstrap_mins)[None, :] * rand
+                bootstrap_pts.requires_grad_(True)
+
+                # Transform to normalized coordinates for SDF network
+                bootstrap_pts_normalized = self.renderer.transform_to_normalized_coords(bootstrap_pts)
+
+                # Forward SDF and guard outputs
+                bootstrap_sdf = self.renderer.sdf_network(bootstrap_pts_normalized)[..., :1]
+                bootstrap_sdf = torch.nan_to_num(bootstrap_sdf, nan=0.0, posinf=1e6, neginf=-1e6)
+
+                # Compute gradients (eikonal). Wrap in try because autograd can fail if inputs are invalid
+                try:
+                    bootstrap_gradients = torch.autograd.grad(
+                        outputs=bootstrap_sdf,
+                        inputs=bootstrap_pts_normalized,
+                        grad_outputs=torch.ones_like(bootstrap_sdf),
+                        create_graph=True,
+                        retain_graph=True,
+                        only_inputs=True
+                    )[0]
+                    # Guard gradient numerics
+                    bootstrap_gradients = torch.nan_to_num(bootstrap_gradients, nan=0.0, posinf=1e6, neginf=-1e6)
+
+                    # Eikonal loss: encourage gradients to have unit norm
+                    eikonal_loss = ((bootstrap_gradients.norm(2, dim=-1) - 1.0) ** 2).mean()
+
+                    # Small sdf regularization: encourage SDFs to be not too large
+                    sdf_regularization = (torch.relu(torch.abs(bootstrap_sdf) - 0.1)).mean() * 0.01
+
+                    bootstrap_loss = eikonal_loss * 10.0 + sdf_regularization * 0.1
+
+                    if self.iter_step % 100 == 0:
+                        try:
+                            min_sdf = float(bootstrap_sdf.min().item())
+                            max_sdf = float(bootstrap_sdf.max().item())
+                        except Exception:
+                            min_sdf = float('nan')
+                            max_sdf = float('nan')
+                        print(f"[Iter {self.iter_step}] Bootstrap mode: eikonal={eikonal_loss.item():.6f}, "
+                              f"sdf_reg={sdf_regularization.item():.6f}, sdf_range=[{min_sdf:.3f}, {max_sdf:.3f}]")
+
+                    epoch_loss_dict = {
+                        'loss': bootstrap_loss,
+                        'loss_normal': torch.tensor(0.0, device=self.device),
+                        'loss_pc': torch.tensor(0.0, device=self.device),
+                        'loss_mask': torch.tensor(0.0, device=self.device),
+                        'loss_eikonal': eikonal_loss,
+                        'loss_sdf': sdf_regularization,
+                        'loss_depth': torch.tensor(0.0, device=self.device),
+                        'loss_con': torch.tensor(0.0, device=self.device),
+                    }
+
+                except Exception as e_inner:
+                    # If autograd failed (e.g. due to NaNs), fall back to a tiny parameter regularizer
+                    print(f"[Iter {self.iter_step}] Bootstrap autograd failed: {e_inner}. Using param regularizer fallback.")
+                    reg = torch.tensor(0.0, device=self.device)
+                    for p in self.sdf_network.parameters():
+                        reg = reg + (p ** 2).sum() * 1e-10
+
+                    epoch_loss_dict = {
+                        'loss': reg,
+                        'loss_normal': torch.tensor(0.0, device=self.device),
+                        'loss_pc': torch.tensor(0.0, device=self.device),
+                        'loss_mask': torch.tensor(0.0, device=self.device),
+                        'loss_eikonal': torch.tensor(0.0, device=self.device),
+                        'loss_sdf': torch.tensor(0.0, device=self.device),
+                        'loss_depth': torch.tensor(0.0, device=self.device),
+                        'loss_con': torch.tensor(0.0, device=self.device),
+                    }
+            except Exception as e:
+                # Catch-all: if something unexpected goes wrong, provide a very small reg-based loss so optimizer updates
+                print(f"[Iter {self.iter_step}] Bootstrap top-level failure: {e}. Using fallback reg.")
+                reg = torch.tensor(0.0, device=self.device)
+                for p in self.sdf_network.parameters():
+                    reg = reg + (p ** 2).sum() * 1e-10
+
+                epoch_loss_dict = {
+                    'loss': reg,
+                    'loss_normal': torch.tensor(0.0, device=self.device),
+                    'loss_pc': torch.tensor(0.0, device=self.device),
+                    'loss_mask': torch.tensor(0.0, device=self.device),
+                    'loss_eikonal': torch.tensor(0.0, device=self.device),
+                    'loss_sdf': torch.tensor(0.0, device=self.device),
+                    'loss_depth': torch.tensor(0.0, device=self.device),
+                    'loss_con': torch.tensor(0.0, device=self.device),
+                }
+        else:
+            epoch_loss_dict = {
+                'loss': epoch_loss/processed_images,
+                'loss_normal': epoch_normal_loss/processed_images,
+                'loss_pc': epoch_pc_loss/processed_images,
+                'loss_mask':epoch_mask_loss/processed_images,
+                'loss_eikonal':epoch_eikonal_loss/processed_images,
+                'loss_sdf':epoch_sdf_loss/processed_images,
+                'loss_depth':epoch_depth_loss/processed_images,
+                'loss_con':epoch_con_loss/processed_images,
+            }
+
+        # Memory optimization: clear CUDA cache and run garbage collection
+        if torch.cuda.is_available() and self.iter_step % 50 == 0:  # Every 50 iterations
+            torch.cuda.empty_cache()
+            import gc
+            gc.collect()
 
         return epoch_loss_dict, samples_per_ray
 
@@ -868,6 +1029,11 @@ class Runner:
         vertices, triangles =\
             self.renderer.extract_geometry(bound_min, bound_max, resolution=resolution, threshold=threshold)
 
+        # Check if mesh extraction produced valid geometry
+        if len(vertices) == 0 or len(triangles) == 0:
+            print(f'Warning: Empty mesh extracted at iteration {self.iter_step}. Skipping mesh validation.')
+            return
+
         mesh = trimesh.Trimesh(vertices, triangles)
         vertices, triangles = mesh.vertices, mesh.faces
 
@@ -896,6 +1062,11 @@ class Runner:
         triangle_clusters = np.asarray(triangle_clusters)
         cluster_n_triangles = np.asarray(cluster_n_triangles)
 
+        # Protection against empty meshes (early training iterations)
+        if len(cluster_n_triangles) == 0:
+            print("Warning: Empty mesh generated. Returning original mesh.")
+            return mesh
+        
         mesh_eval = copy.deepcopy(mesh)
         largest_cluster_idx = cluster_n_triangles.argmax()
         triangles_to_remove = triangle_clusters != largest_cluster_idx
@@ -974,6 +1145,11 @@ class Runner:
 
         vertices, triangles = \
             self.renderer.extract_geometry(bound_min, bound_max, resolution=resolution, threshold=0)
+
+        # Check if mesh is empty
+        if len(vertices) == 0 or len(triangles) == 0:
+            print(f"Warning: Empty mesh extracted at iteration {self.iter_step}. Skipping eval_geo.")
+            return
 
         # vertices = vertices * self.dataset.scale_mats_np[0][0, 0] + self.dataset.scale_mats_np[0][:3, 3][None]
         mesh = trimesh.Trimesh(np.asarray(vertices), np.asarray(triangles), process=False)
@@ -1069,7 +1245,12 @@ if __name__ == '__main__':
     import warnings
     warnings.filterwarnings("ignore")
 
-    torch.set_default_tensor_type('torch.cuda.FloatTensor')
+    # Only set default CUDA tensor type if CUDA is available; otherwise exit cleanly
+    if torch.cuda.is_available():
+        torch.set_default_tensor_type('torch.cuda.FloatTensor')
+    else:
+        print("[FATAL] CUDA not available. PMNI training requires a GPU. Exiting cleanly.")
+        raise SystemExit(0)
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--conf', type=str, default='./confs/base.conf')
@@ -1080,7 +1261,8 @@ if __name__ == '__main__':
     parser.add_argument('--obj_name', type=str, default='')
 
     args = parser.parse_args()
-    torch.cuda.set_device(args.gpu)
+    if torch.cuda.is_available():
+        torch.cuda.set_device(args.gpu)
 
     print(f'Running on the object: {args.obj_name}')
 

@@ -1,8 +1,18 @@
 import torch
 import torch.nn as nn
 import numpy as np
-import tinycudann as tcnn
-from icecream import ic
+try:
+    import tinycudann as tcnn
+    TCNN_AVAILABLE = True
+except (ImportError, OSError):
+    print("Warning: tinycudann not available, using CPU-compatible fallback")
+    TCNN_AVAILABLE = False
+    tcnn = None
+try:
+    from icecream import ic
+except ImportError:
+    # Fallback if icecream not installed
+    ic = lambda *args: None if not args else (args[0] if len(args) == 1 else args)
 
 class SDFNetwork(nn.Module):
     def __init__(self,
@@ -22,19 +32,21 @@ class SDFNetwork(nn.Module):
 
         dims = [d_in] + [d_hidden for _ in range(n_layers)] + [d_out]
 
-        if encoding_config is not None:
+        if encoding_config is not None and TCNN_AVAILABLE:
             self.encoding = tcnn.Encoding(d_in, encoding_config).to(torch.float32)
             dims[0] = self.encoding.n_output_dims
             if input_concat:
                 dims[0] += d_in
         else:
             self.encoding = None
+            if encoding_config is not None and not TCNN_AVAILABLE:
+                print("Warning: Encoding config provided but tinycudann not available, using plain MLP")
 
         self.num_layers = len(dims)
         self.skip_in = skip_in
 
         self.bindwidth = 0
-        self.enc_dim = self.encoding.n_output_dims
+        self.enc_dim = self.encoding.n_output_dims if self.encoding is not None else 0
 
         for l in range(0, self.num_layers - 1):
             if l + 1 in self.skip_in:
